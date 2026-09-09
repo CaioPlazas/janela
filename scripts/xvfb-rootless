@@ -1,0 +1,11 @@
+#!/bin/sh
+# Rootless Xvfb: Ubuntu's Xvfb + libXfont2/libfontenc extracted into $HOME.
+# Two things must be re-set here, because xpra's conda env clobbers them:
+#   LD_LIBRARY_PATH - libXfont2 / libfontenc live under $HOME, not /usr/lib
+#   XKB_BINDIR      - Xvfb hardcodes /usr/bin/xkbcomp otherwise, and dies
+X="$HOME/opt/xstack"
+export LD_LIBRARY_PATH="$X/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$X/usr/bin:$PATH"
+export XKB_BINDIR="$X/usr/bin"
+export XKB_CONFIG_ROOT="$X/usr/share/X11/xkb"
+exec "$X/usr/bin/Xvfb" "$@"

@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# Run a command on the Janela session's display, leaving everything else alone.
+#
+#   janelas simvision
+#   janelas python plot.py --live
+#   janelas 'vsim -gui & sleep 2; xterm'
+#
+# Plain `simvision` is unaffected: nothing is exported, only this one command is
+# given a different DISPLAY.
+#
+# A script rather than a shell function, so it works from bash, zsh and tcsh
+# alike - an EDA server may default to any of them.
+#
+# It inherits your environment exactly as it stands, which is the point: the
+# modules you loaded and the licence variables you set are already in it.
+set -u
+
+JANELA_DIR="${JANELA_DIR:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
+SERVER="$JANELA_DIR/janela-server"
+
+if [ ! -f "$SERVER" ]; then
+    printf 'janelas: cannot find janela-server next to me (looked in %s)\n' "$JANELA_DIR" >&2
+    exit 1
+fi
+
+[ $# -gt 0 ] || { printf 'usage: janelas <command> [args...]\n' >&2; exit 2; }
+
+# Never start a session here. Creating one silently was worse than failing:
+# the tool went to a display nobody was attached to, and the only sign was that
+# the window never appeared. If there is nowhere to send this, say so.
+TARGET="$(bash "$SERVER" current 2>/dev/null)"
+if [ -z "$TARGET" ]; then
+    printf 'janelas: no current session, so there is nowhere to send %s.\n' "$1" >&2
+    printf '        Open one in VS Code (Janela: New Session), or here:\n' >&2
+    printf '            %s new "Janela"\n' "$SERVER" >&2
+    exit 1
+fi
+
+# Say where it went. When a tool fails for its own reasons, this is what
+# distinguishes "Janela sent it nowhere" from "the tool did not start".
+printf 'janelas: %s -> DISPLAY=%s\n' "$1" "$TARGET" >&2
+
+# One argument may contain shell syntax; more than one is a command and its
+# arguments, passed through untouched.
+if [ $# -eq 1 ]; then
+    exec env DISPLAY="$TARGET" sh -c "$1"
+fi
+exec env DISPLAY="$TARGET" "$@"

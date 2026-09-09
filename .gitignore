@@ -1,0 +1,9 @@
+node_modules/
+dist/
+out/
+build/
+bundle/
+*.vsix.tmp
+testbench/counter.vvp
+testbench/counter.vcd
+.vscode-test/

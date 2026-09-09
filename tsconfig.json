@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    // esbuild does the real build; this is only for checking, and the spikes
+    // are ES modules with top-level await.
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "out",
+    "strict": true,
+    // Dead code should be a compile error, not something found by grepping
+    // months later: an unread counter survived a whole release this way.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  // The spikes are TypeScript too, and Node's type stripping does not check
+  // them: without this they are only ever checked by running them.
+  "include": ["src", "spikes"]
+}

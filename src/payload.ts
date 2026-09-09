@@ -1,0 +1,182 @@
+/**
+ * Getting xpra onto a server that cannot reach the internet.
+ *
+ * The machine the user sits at can download; the server cannot. So the packages
+ * are fetched here, verified here, and copied over the ssh connection that is
+ * already open. The server links them into an environment offline.
+ *
+ * Two payloads exist and they weigh the same: the bundled VSIX carries a
+ * conda-pack'd tarball (211 MB), this one downloads 181 conda packages
+ * (201 MB). The difference is where the bytes wait, not how many cross the
+ * wire - see docs/adr/0003.
+ */
+
+import { createHash } from "crypto";
+import * as fs from "fs";
+import * as path from "path";
+
+/** A bare static binary, so nothing has to be unpacked on Windows. */
+export const MICROMAMBA_URL =
+  "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64";
+
+export interface PayloadEntry {
+  url: string;
+  /** Empty when the list was generated without --sha256, which it should not be. */
+  sha256: string;
+  name: string;
+}
+
+/**
+ * Read the pinned list. Its format is conda's `@EXPLICIT`: one URL per line,
+ * with the checksum after a `#`.
+ */
+export function parseExplicit(text: string): PayloadEntry[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("http"))
+    .map((line) => {
+      const [url, sha256 = ""] = line.split("#");
+      return { url, sha256, name: url.slice(url.lastIndexOf("/") + 1) };
+    });
+}
+
+export function sha256Of(file: string): string {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+/** A file counts as present only if it matches what the list says it should be. */
+export function isIntact(file: string, sha256: string): boolean {
+  try {
+    if (!fs.statSync(file).isFile()) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return sha256 ? sha256Of(file) === sha256 : true;
+}
+
+export interface DownloadReport {
+  downloaded: number;
+  reused: number;
+  failed: string[];
+  bytes: number;
+}
+
+/**
+ * Fetch everything the list names into `directory`, verifying each file.
+ *
+ * Re-running is cheap: anything already there and intact is left alone, so a
+ * download interrupted at package 150 resumes rather than restarts.
+ */
+export async function downloadPayload(
+  entries: PayloadEntry[],
+  directory: string,
+  report: (done: number, total: number, name: string) => void,
+  concurrency = 6,
+): Promise<DownloadReport> {
+  fs.mkdirSync(directory, { recursive: true });
+  const result: DownloadReport = { downloaded: 0, reused: 0, failed: [], bytes: 0 };
+  let done = 0;
+  const queue = [...entries];
+
+  async function worker(): Promise<void> {
+    for (;;) {
+      const entry = queue.shift();
+      if (!entry) {
+        return;
+      }
+      const file = path.join(directory, entry.name);
+      if (isIntact(file, entry.sha256)) {
+        result.reused++;
+      } else {
+        let saved = false;
+        for (let attempt = 0; attempt < 3 && !saved; attempt++) {
+          try {
+            const response = await fetch(entry.url);
+            if (!response.ok) {
+              continue;
+            }
+            fs.writeFileSync(file, Buffer.from(await response.arrayBuffer()));
+            saved = isIntact(file, entry.sha256);
+          } catch {
+            // a corporate network drops connections; that is what retries are for
+          }
+        }
+        if (saved) {
+          result.downloaded++;
+        } else {
+          result.failed.push(entry.name);
+          fs.rmSync(file, { force: true });
+          continue;
+        }
+      }
+      result.bytes += fs.statSync(file).size;
+      report(++done, entries.length, entry.name);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return result;
+}
+
+/** Download the linux micromamba that will link the packages on the server. */
+export async function downloadMicromamba(directory: string): Promise<string | undefined> {
+  fs.mkdirSync(directory, { recursive: true });
+  const target = path.join(directory, "micromamba");
+  if (fs.existsSync(target) && fs.statSync(target).size > 1_000_000) {
+    return target;
+  }
+  const response = await fetch(MICROMAMBA_URL);
+  if (!response.ok) {
+    return undefined;
+  }
+  fs.writeFileSync(target, Buffer.from(await response.arrayBuffer()), { mode: 0o755 });
+  return target;
+}
+
+/** Everything the server needs, laid out the way `bootstrap-offline` expects. */
+export function stagingLayout(root: string) {
+  return {
+    root,
+    packages: path.join(root, "pkgs"),
+    explicit: path.join(root, "explicit.txt"),
+    micromamba: path.join(root, "micromamba"),
+  };
+}
+
+/**
+ * The other payload: distribution packages, about 15 MB rather than 201.
+ *
+ * Only usable when the server already has the interpreter and the libraries
+ * these packages were built against, which is what `janela-server rpm-check`
+ * decides. The list is generated by `scripts/build-rpm-list.sh` and carries the
+ * answer with it: the packages to fetch, and the libraries that must already be
+ * there for them to load.
+ */
+export interface RpmList {
+  /** `3.11` or `3.12`; the packages only import into that exact interpreter. */
+  python: string;
+  /** Sonames the machine must already provide. */
+  libs: string[];
+  entries: PayloadEntry[];
+}
+
+export function parseRpmList(text: string): RpmList {
+  const list: RpmList = { python: "", libs: [], entries: [] };
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("python ")) {
+      list.python = line.slice(7).trim();
+    } else if (line.startsWith("need ")) {
+      list.libs.push(line.slice(5).trim());
+    } else if (line.startsWith("rpm ")) {
+      const [, sha256, url] = line.split(/\s+/);
+      if (sha256 && url) {
+        list.entries.push({ url, sha256, name: url.slice(url.lastIndexOf("/") + 1) });
+      }
+    }
+  }
+  return list;
+}

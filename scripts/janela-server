@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+#
+# Everything Janela does on the server, in one script invoked over ssh.
+#
+#   janela-server prefix            where xpra is, or nothing
+#   janela-server list              what `xpra list` says, raw
+#   janela-server status            every session, its windows and the current one
+#   janela-server info <display>    what `xpra info` says, raw
+#   janela-server new [name]        create a session, print its display
+#   janela-server run <display> CMD  start a program in a session already running
+#   janela-server kill <display>    end one
+#   janela-server close <d> <wid>   ask one window's application to close
+#   janela-server kill-window <d> <wid>  signal the process behind a window
+#   janela-server current           the session janelas sends things to
+#   janela-server ws <display>      the loopback port its websocket is on
+#   janela-server env [display]     print the export line for your own shell
+#   janela-server install [prefix]  put xpra in ~/.janela/xpra, without root
+#   janela-server bootstrap <tgz>   unpack a pushed xpra bundle, no internet needed
+#   janela-server rpm-check <py> [lib...]  can this machine run the distribution packages?
+#   janela-server bootstrap-rpm <dir> <py> extract pushed .rpm files, no root
+#   janela-server shell-setup [--apply]  put `janelas` on your PATH
+#   janela-server survey            what this machine has, for diagnosis
+#
+# It lives here rather than in the extension because every question it answers
+# is about this filesystem: which xpra, which X server, which displays are free.
+# The extension runs on the user's laptop and cannot see any of that.
+#
+# Sessions listen on unix sockets only. There is no TCP socket, no port to
+# forward and no passphrase: the client reaches them over ssh, which has
+# already authenticated.
+set -uo pipefail
+
+# Xvfb signals its parent with SIGUSR1 when the display is ready, and the
+# default action for it is to terminate. Without this the script dies mid-start
+# with no output at all - which is exactly how it failed the first time it ran
+# over ssh. Ignoring the signal is also the handshake Xvfb expects: it only
+# sends it when the parent has it set to SIG_IGN.
+trap '' USR1
+
+# Inside VS Code's folders by preference, but NOT under any extension's
+# per-extension storage: that path is deleted when the extension is uninstalled,
+# which is how a working xpra was lost once already.
+# The extension sends paths as `~/.vscode-server/janela` and passes them in
+# quoted, which stops the shell expanding the tilde: `$JANELA_HOME` would then
+# be a literal `~` directory under $HOME. scp expands it and this script would
+# not, so the payload would arrive somewhere the install could not find it.
+untilde() {
+    case "$1" in
+    "~")   printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${1#\~/}" ;;
+    *)     printf '%s\n' "$1" ;;
+    esac
+}
+
+if [ -z "${JANELA_HOME:-}" ]; then
+    JANELA_HOME="$HOME/.vscode-server/janela"
+    # An earlier version kept everything in ~/.janela. Keep using it when it is
+    # there and the new location is not, so an upgrade does not orphan a working
+    # xpra. Only when the caller said nothing: a JANELA_HOME passed in is the
+    # configured directory and must win, which it did not until this was fixed.
+    [ -d "$JANELA_HOME" ] || [ ! -d "$HOME/.janela" ] || JANELA_HOME="$HOME/.janela"
+else
+    JANELA_HOME="$(untilde "$JANELA_HOME")"
+fi
+CURRENT_FILE="$JANELA_HOME/current-display"
+die() { printf 'janela-server: %s\n' "$*" >&2; exit 1; }
+
+# --- which xpra? -------------------------------------------------------------
+# Ordered by how deliberate each one is: something the user chose, then what we
+# unpacked for them, then whatever the machine already had.
+find_prefix() {
+    if [ -n "${JANELA_XPRA_PREFIX:-}" ]; then
+        CONFIGURED="$(untilde "$JANELA_XPRA_PREFIX")"
+        [ -x "$CONFIGURED/bin/xpra" ] && { printf '%s\n' "$CONFIGURED"; return 0; }
+    fi
+    for candidate in "$JANELA_HOME/xpra" \
+                     "$HOME/micromamba/envs/xpra" "$HOME/miniconda3/envs/xpra" \
+                     "$HOME/anaconda3/envs/xpra" "$HOME/.conda/envs/xpra"; do
+        [ -x "$candidate/bin/xpra" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    if command -v xpra >/dev/null 2>&1; then
+        # /usr/bin/xpra -> prefix /usr
+        printf '%s\n' "$(dirname "$(dirname "$(command -v xpra)")")"; return 0
+    fi
+    return 1
+}
+
+PREFIX="$(find_prefix || true)"
+xpra() {
+    [ -n "$PREFIX" ] || die "no xpra on this machine. Run 'janela-server survey' to see what is here."
+    # A conda-pack'd env has `#!/usr/bin/env python` shebangs: its own bin must
+    # lead PATH or nothing in it starts.
+    PATH="$PREFIX/bin:$PATH" "$PREFIX/bin/xpra" "$@"
+}
+
+# --- which X server? ---------------------------------------------------------
+# The step that decides whether anything can run at all. A display the user
+# already owns is best: on a machine with VNC it needs nothing installed.
+displays_with_sockets() {
+    ls /tmp/.X11-unix/ 2>/dev/null | sed -n 's/^X\([0-9]\+\)$/\1/p'
+}
+
+# /tmp/.X11-unix is shared: on a multi-user machine it holds other people's
+# displays as well. Borrowing one of those would fail on authentication at best,
+# and on an EDA server there will be several.
+owns_display() {
+    [ "$(stat -c %u "/tmp/.X11-unix/X$1" 2>/dev/null)" = "$(id -u)" ]
+}
+
+pick_x_backend() {
+    # What the user is already looking at wins, if they told us.
+    if [ -n "${DISPLAY:-}" ]; then
+        d="${DISPLAY#:}"; d="${d%%.*}"
+        if [ -S "/tmp/.X11-unix/X$d" ] && owns_display "$d" && [ ! -e "/run/user/$(id -u)/xpra/$d" ]; then
+            printf 'use-display::%s\n' "$d"; return 0
+        fi
+    fi
+    for n in $(displays_with_sockets); do
+        owns_display "$n" || continue
+        # Do not borrow a display we are already serving.
+        [ -e "/run/user/$(id -u)/xpra/$n" ] && continue
+        printf 'use-display::%s\n' "$n"; return 0
+    done
+    if command -v Xvfb >/dev/null 2>&1 && command -v xkbcomp >/dev/null 2>&1; then
+        printf 'xvfb:%s\n' "$(command -v Xvfb)"; return 0
+    fi
+    if [ -x "$HOME/opt/xstack/bin/xvfb-rootless" ]; then
+        printf 'xstack:%s\n' "$HOME/opt/xstack/bin/xvfb-rootless"; return 0
+    fi
+    return 1
+}
+
+# The websocket the HTML5 client connects through. Bound to loopback only and
+# reached over an ssh tunnel the extension opens, so there is still no port
+# exposed on the network and still no passphrase.
+free_port() {
+    for p in $(seq "${JANELA_PORT_FROM:-14000}" "${JANELA_PORT_TO:-14099}"); do
+        if command -v ss >/dev/null 2>&1; then
+            ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN && continue
+        elif command -v netstat >/dev/null 2>&1; then
+            netstat -ltn 2>/dev/null | grep -q "[:.]$p " && continue
+        fi
+        printf '%s\n' "$p"; return 0
+    done
+    return 1
+}
+
+# A display is free when nothing is serving it. xpra leaves its socket directory
+# behind when a session dies, and treating those as occupied meant every display
+# a session had ever used was lost for good: on a machine left running they
+# accumulate until no session can be started at all. Asked in a twenty-display
+# range, that takes about a day.
+free_display() {
+    LIVE_DISPLAYS="$(xpra list 2>/dev/null | grep -oE 'LIVE session at :[0-9]+' | grep -oE '[0-9]+$' | sort -u)"
+    for n in $(seq "${JANELA_DISPLAY_FROM:-100}" "${JANELA_DISPLAY_TO:-199}"); do
+        # An X server is running there - ours, or somebody else's on a shared
+        # machine. Either way it is not free.
+        [ -S "/tmp/.X11-unix/X$n" ] && continue
+        printf '%s\n' "$LIVE_DISPLAYS" | grep -qx "$n" && continue
+        printf ':%s\n' "$n"; return 0
+    done
+    return 1
+}
+
+# Remove what a dead session left on a display we are about to reuse. Only ever
+# called for a display free_display has already found unowned, and only for our
+# own runtime directory.
+clear_stale() {
+    [ -n "${1:-}" ] || return 0
+    rm -rf "/run/user/$(id -u)/xpra/${1#:}" 2>/dev/null
+    rm -f "$HOME/.xpra/$(hostname)-${1#:}" "/run/user/$(id -u)/xpra/$(hostname)-${1#:}" 2>/dev/null
+    return 0
+}
+
+case "${1:-}" in
+prefix)
+    [ -n "$PREFIX" ] || exit 1
+    printf '%s\n' "$PREFIX"
+    ;;
+
+list)
+    xpra list 2>&1
+    ;;
+
+info)
+    [ -n "${2:-}" ] || die "info needs a display"
+    xpra info "$2" 2>/dev/null
+    ;;
+
+new)
+    NAME="${2:-Janela}"
+    [ -n "$PREFIX" ] || die \
+"no xpra on this machine. Install it with 'janela-server install', point
+ janela.serverPrefix at an existing one, or run scripts/install-server.sh."
+    DISP="$(free_display)" || die "no free display between :100 and :199"
+    BACKEND="$(pick_x_backend)" || die \
+"no X server available. Janela can borrow a display you already own (start a VNC
+ session), use Xvfb if it is installed, or use ~/opt/xstack if it was unpacked
+ there. None of the three is present."
+
+    clear_stale "$DISP"
+    PORT="$(free_port)" || die "no free port between 14000 and 14099 for the websocket"
+
+    # sharing=yes because every application window gets its own client: without
+    # it the second window to open would evict the first.
+    ARGS=(--daemon=yes --session-name="$NAME"
+          --bind-tcp="127.0.0.1:$PORT" --sharing=yes
+          --notifications=no --pulseaudio=no --speaker=off --microphone=off
+          --webcam=no --printing=no --mdns=no
+          # so the client's own menu can start programs as well as this script
+          --start-new-commands=yes)
+
+    # A session with nothing running in it draws nothing at all: xpra forwards
+    # windows, and an empty display has none. That is indistinguishable from a
+    # broken client, so a new session gets something to look at - a terminal,
+    # which is also where the next application gets launched from.
+    # exit-with-children=no: closing that terminal must not end the session.
+    START_CMD="${JANELA_START:-}"
+    if [ -z "$START_CMD" ]; then
+        for candidate in xterm xfce4-terminal konsole gnome-terminal x-terminal-emulator \
+                         "$HOME/opt/xstack/usr/bin/xterm"; do
+            if command -v "$candidate" >/dev/null 2>&1; then START_CMD="$candidate"; break; fi
+            if [ -x "$candidate" ]; then START_CMD="$candidate"; break; fi
+        done
+    fi
+    if [ -n "$START_CMD" ] && [ "$START_CMD" != "none" ]; then
+        ARGS+=(--start-child="$START_CMD" --exit-with-children=no)
+    fi
+
+    STARTLOG="$(mktemp)"
+    case "$BACKEND" in
+    use-display:*)
+        BORROWED="${BACKEND#use-display:}"
+        xpra start "$BORROWED" --use-display "${ARGS[@]}" >"$STARTLOG" 2>&1
+        DISP="$BORROWED"
+        ;;
+    xvfb:*|xstack:*)
+        XVFB_BIN="${BACKEND#*:}"
+        xpra start "$DISP" \
+            --xvfb="$XVFB_BIN +extension Composite -screen 0 ${JANELA_GEOM:-1920x1080x24+32} -nolisten tcp -noreset -auth $HOME/.Xauthority" \
+            "${ARGS[@]}" >"$STARTLOG" 2>&1
+        ;;
+    esac
+
+    for _ in $(seq 1 60); do
+        xpra list 2>/dev/null | grep -q "LIVE session at $DISP" && break
+        sleep 0.5
+    done
+    xpra list 2>/dev/null | grep -q "LIVE session at $DISP" || {
+        printf 'janela-server: the session did not start.\n' >&2
+        printf -- '--- what xpra said ---\n' >&2
+        cat "$STARTLOG" >&2
+        printf -- '--- its own log ---\n' >&2
+        tail -20 "/run/user/$(id -u)/xpra/${DISP#:}/server.log" 2>/dev/null >&2
+        rm -f "$STARTLOG"
+        exit 1
+    }
+    rm -f "$STARTLOG"
+    # `janelas` reads this file to know where to send things. A silent failure
+    # here leaves a session running that nothing on the command line can find -
+    # the same "the tool went somewhere invisible" fault the wrapper was changed
+    # to stop causing. The session itself is fine, so this warns rather than dies.
+    if ! mkdir -p "$JANELA_HOME" 2>/dev/null ||
+       ! printf '%s\n' "$DISP" > "$CURRENT_FILE" 2>/dev/null; then
+        printf 'janela-server: warning: could not record the current session in %s\n' "$CURRENT_FILE" >&2
+        printf '               janelas will not find %s until that is fixed\n' "$DISP" >&2
+    fi
+    printf 'display %s\nbackend %s\nport %s\nstarted %s\n' "$DISP" "${BACKEND%%:*}" "$PORT" "${START_CMD:-nothing}"
+    ;;
+
+current)
+    # What `janelas` targets. Recorded when a session is created and confirmed
+    # live before being trusted: a display that has died must not send a tool
+    # somewhere invisible.
+    CUR="$(cat "$CURRENT_FILE" 2>/dev/null)"
+    if [ -n "$CUR" ] && xpra list 2>/dev/null | grep -q "LIVE session at $CUR"; then
+        printf '%s\n' "$CUR"
+        exit 0
+    fi
+    # Stale. Fall back to the only live session if there is exactly one.
+    LIVE="$(xpra list 2>/dev/null | grep -oE 'LIVE session at :[0-9]+' | grep -oE ':[0-9]+' | sort -u)"
+    if [ "$(printf '%s\n' "$LIVE" | grep -c .)" = "1" ] && [ -n "$LIVE" ]; then
+        mkdir -p "$JANELA_HOME" 2>/dev/null
+        printf '%s\n' "$LIVE" > "$CURRENT_FILE" 2>/dev/null
+        printf '%s\n' "$LIVE"
+        exit 0
+    fi
+    rm -f "$CURRENT_FILE" 2>/dev/null
+    exit 1
+    ;;
+
+set-current)
+    # Recording it IS the job here, so a failure is a failure.
+    [ -n "${2:-}" ] || die "set-current needs a display"
+    mkdir -p "$JANELA_HOME" || die "cannot create $JANELA_HOME"
+    printf '%s\n' "$2" > "$CURRENT_FILE" || die "cannot write $CURRENT_FILE"
+    printf '%s\n' "$2"
+    ;;
+
+env)
+    # For launching from your own terminal, where module load and the licence
+    # server have already been dealt with. `xpra control start` cannot inherit
+    # that: it runs a fresh login shell.
+    ENV_DISPLAY="${2:-}"
+    if [ -z "$ENV_DISPLAY" ]; then
+        ENV_DISPLAY="$(xpra list 2>/dev/null | grep -oE 'LIVE session at :[0-9]+' | grep -oE ':[0-9]+' | tail -1)"
+    fi
+    [ -n "$ENV_DISPLAY" ] || die "no live session to point at"
+    printf 'export DISPLAY=%s\n' "$ENV_DISPLAY"
+    ;;
+
+bootstrap)
+    # The locked-down case: a packed environment arrives over ssh and is
+    # unpacked here. No internet, no conda, no root, no package request.
+    TGZ="$(untilde "${2:-}")"
+    [ -f "$TGZ" ] || die "bootstrap needs the path of a bundle already copied here"
+    DEST="$(untilde "${3:-$JANELA_HOME/xpra}")"
+    mkdir -p "$DEST" || die "cannot create $DEST"
+    # A stale environment must go: tar would merge the two.
+    rm -rf "${DEST:?}/"* 2>/dev/null
+    tar xzf "$TGZ" -C "$DEST" || die "could not unpack $TGZ"
+    # conda-pack bakes the build prefix into every script; conda-unpack rewrites
+    # it. It is itself a `#!/usr/bin/env python` script, so it goes through the
+    # environment's own python rather than being executed.
+    if [ -x "$DEST/bin/conda-unpack" ]; then
+        "$DEST/bin/python" "$DEST/bin/conda-unpack" || die "conda-unpack failed in $DEST"
+    fi
+    [ -x "$DEST/bin/xpra" ] || die "no bin/xpra in $DEST after unpacking"
+    rm -f "$TGZ"
+    printf 'prefix %s\n' "$DEST"
+    PATH="$DEST/bin:$PATH" "$DEST/bin/xpra" --version 2>&1 | head -1
+    ;;
+
+bootstrap-offline)
+    # The lite payload: conda packages fetched on the machine that has internet,
+    # copied here, and linked into an environment without touching the network.
+    # Proven to work from a cache that is not where the packages were downloaded.
+    STAGING="$(untilde "${2:-$JANELA_HOME/staging}")"
+    DEST="$(untilde "${3:-$JANELA_HOME/xpra}")"
+    [ -d "$STAGING/pkgs" ] || die "no package cache at $STAGING/pkgs"
+    [ -f "$STAGING/explicit.txt" ] || die "no explicit list at $STAGING/explicit.txt"
+    MM="$STAGING/micromamba"
+    [ -x "$MM" ] || chmod +x "$MM" 2>/dev/null || die "no micromamba at $MM"
+
+    rm -rf "${DEST:?}"
+    CONDA_PKGS_DIRS="$STAGING/pkgs" MAMBA_ROOT_PREFIX="$JANELA_HOME/mamba-root" \
+        "$MM" create -y -p "$DEST" --offline --file "$STAGING/explicit.txt" >"$STAGING/install.log" 2>&1 || {
+            printf 'janela-server: the offline install failed:\n' >&2
+            tail -20 "$STAGING/install.log" >&2
+            exit 1
+        }
+    [ -x "$DEST/bin/xpra" ] || die "no bin/xpra in $DEST after installing"
+    rm -rf "$STAGING"
+    printf 'prefix %s\n' "$DEST"
+    PATH="$DEST/bin:$PATH" "$DEST/bin/xpra" --version 2>&1 | head -1
+    ;;
+
+install)
+    # The sibling script does the work; it is pushed alongside this one. Kept
+    # separate because it is also the documented way to do this by hand.
+    HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [ -f "$HERE/install-server.sh" ] || die \
+"install-server.sh is not next to this script. The extension pushes both; if you
+ copied only one, copy the other."
+    bash "$HERE/install-server.sh" --prefix "$(untilde "${2:-$JANELA_HOME/xpra}")"
+    ;;
+
+run)
+    [ -n "${2:-}" ] || die "run needs a display"
+    RUN_DISPLAY="$2"
+    shift 2
+    [ $# -gt 0 ] || die "run needs a command"
+    # Through a login shell, because on an EDA server the command only means
+    # anything after the profile has run: `module load`, conda, PATH. And
+    # through xpra's own control channel, so the program lands in the session
+    # without anyone having to know its display.
+    xpra control "$RUN_DISPLAY" start "bash -lc $(printf '%q' "$*")" 2>&1
+    ;;
+
+kill)
+    [ -n "${2:-}" ] || die "kill needs a display"
+    xpra stop "$2" 2>&1
+    ;;
+
+close)
+    # Ask the application to close, the way clicking its X does. It may put up
+    # a "save your work?" dialog, and that is the point: this is the polite one.
+    [ -n "${2:-}" ] || die "close needs a display"
+    [ -n "${3:-}" ] || die "close needs a window id"
+    xpra control "$2" close "$3" 2>&1
+    ;;
+
+kill-window)
+    # For an application that ignores the close request, or has hung and cannot
+    # answer it. TERM first, because a tool that can still tidy up should;
+    # KILL only for one that has stopped listening.
+    [ -n "${2:-}" ] || die "kill-window needs a display"
+    [ -n "${3:-}" ] || die "kill-window needs a window id"
+    PID="$(xpra info "$2" 2>/dev/null | sed -n "s/^windows\.$3\.pid=//p" | head -1)"
+    case "$PID" in
+    ''|0|*[!0-9]*) die \
+"window $3 on $2 does not say which process owns it, so there is nothing to
+ signal. Close it from inside the application, or kill the whole session." ;;
+    esac
+    kill -TERM "$PID" 2>/dev/null || die "could not signal $PID"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$PID" 2>/dev/null || { printf 'closed %s (pid %s)\n' "$3" "$PID"; exit 0; }
+        sleep 0.5
+    done
+    kill -KILL "$PID" 2>/dev/null
+    printf 'killed %s (pid %s)\n' "$3" "$PID"
+    ;;
+
+rpm-check)
+    # Can this machine run xpra from its own distribution packages, rather than
+    # from a 200 MB conda environment? Everything below is a fact about the
+    # machine that only the machine can answer, which is why the extension asks
+    # rather than assumes.
+    #
+    #   janela-server rpm-check 3.11 libX11.so.6 libgdk-3.so.0 ...
+    #
+    # The library list is generated from the packages themselves and passed in;
+    # this script deliberately keeps no copy of it, so there is one place where
+    # that list can be wrong.
+    PYTAG="${2:-}"
+    [ -n "$PYTAG" ] || die "rpm-check needs a python version, e.g. 3.11"
+    shift 2
+    VERDICT=yes
+
+    PYBIN=""
+    for candidate in "/usr/bin/python$PYTAG" "/usr/libexec/platform-python$PYTAG"; do
+        [ -x "$candidate" ] && { PYBIN="$candidate"; break; }
+    done
+    [ -n "$PYBIN" ] || PYBIN="$(command -v "python$PYTAG" 2>/dev/null || true)"
+    if [ -n "$PYBIN" ]; then
+        printf 'python     %s %s\n' "$PYTAG" "$PYBIN"
+    else
+        printf 'python     %s missing\n' "$PYTAG"; VERDICT=no
+    fi
+
+    # rpm2cpio ships with rpm and cpio is in the base install, so on anything
+    # RPM-based both are present. Checked anyway: this route is worthless
+    # without them and the failure would otherwise appear halfway through.
+    MISSING_TOOLS=""
+    for tool in rpm2cpio cpio; do
+        command -v "$tool" >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS $tool"
+    done
+    if [ -n "$MISSING_TOOLS" ]; then
+        printf 'extract    missing%s\n' "$MISSING_TOOLS"; VERDICT=no
+    else
+        printf 'extract    ok\n'
+    fi
+
+    # PyGObject reaches GTK through typelibs, which belong to the system's own
+    # gobject-introspection rather than to anything downloadable here. A machine
+    # with libgdk but no typelib imports gi and then fails on Gtk, which is the
+    # confusing half-working case this check exists to prevent.
+    TYPELIB=""
+    for dir in /usr/lib64/girepository-1.0 /usr/lib/girepository-1.0 \
+               /usr/lib/x86_64-linux-gnu/girepository-1.0; do
+        [ -f "$dir/Gtk-3.0.typelib" ] && { TYPELIB="$dir"; break; }
+    done
+    if [ -n "$TYPELIB" ]; then
+        printf 'typelibs   %s\n' "$TYPELIB"
+    else
+        printf 'typelibs   missing Gtk-3.0.typelib\n'; VERDICT=no
+    fi
+
+    if [ $# -gt 0 ]; then
+        LDCACHE="$(ldconfig -p 2>/dev/null || true)"
+        MISSING=""
+        for soname in "$@"; do
+            case "$LDCACHE" in
+            *"$soname"*) continue ;;
+            esac
+            # Not every machine has a cache entry for a library that is present;
+            # look where the loader would look before calling it missing.
+            FOUND=""
+            for dir in /usr/lib64 /lib64 /usr/lib /usr/lib/x86_64-linux-gnu; do
+                [ -e "$dir/$soname" ] && { FOUND=1; break; }
+            done
+            [ -n "$FOUND" ] || MISSING="$MISSING $soname"
+        done
+        if [ -n "$MISSING" ]; then
+            printf 'libraries  missing%s\n' "$MISSING"; VERDICT=no
+        else
+            printf 'libraries  ok (%s checked)\n' "$#"
+        fi
+    fi
+
+    printf 'verdict    %s\n' "$VERDICT"
+    [ "$VERDICT" = yes ]
+    ;;
+
+bootstrap-rpm)
+    # The small payload: distribution packages fetched on the machine that has
+    # internet, extracted here without root. No rpm database is touched - the
+    # files land under our own directory and a wrapper points xpra at them.
+    STAGING="$(untilde "${2:-$JANELA_HOME/staging}")"
+    PYTAG="${3:-}"
+    DEST="$(untilde "${4:-$JANELA_HOME/xpra}")"
+    [ -n "$PYTAG" ] || die "bootstrap-rpm needs a python version, e.g. 3.11"
+    [ -d "$STAGING" ] || die "no staging directory at $STAGING"
+    set -- "$STAGING"/*.rpm
+    [ -f "$1" ] || die "no .rpm files in $STAGING"
+    PYBIN="$(command -v "python$PYTAG" 2>/dev/null || true)"
+    [ -x "/usr/bin/python$PYTAG" ] && PYBIN="/usr/bin/python$PYTAG"
+    [ -n "$PYBIN" ] || die "no python$PYTAG on this machine"
+
+    ROOT="$DEST/root"
+    rm -rf "${DEST:?}"
+    mkdir -p "$ROOT/../bin" "$ROOT" || die "cannot create $DEST"
+    for rpm in "$@"; do
+        ( cd "$ROOT" && rpm2cpio "$rpm" | cpio -idmu --quiet --no-absolute-filenames ) \
+            || die "could not extract $(basename "$rpm")"
+    done
+
+    # xpra re-executes itself when it daemonises and when it starts a child, so
+    # XPRA_COMMAND has to name this wrapper. Without it the daemon looks for
+    # /usr/bin/xpra, which on this machine is not installed.
+    cat > "$DEST/bin/xpra" <<WRAPPER
+#!/bin/sh
+# Generated by janela-server bootstrap-rpm. Runs the extracted packages in place.
+R="$ROOT"
+export XPRA_INSTALL_PREFIX="\$R/usr"
+export XPRA_APP_DIR="\$R/usr/share/xpra"
+export XPRA_DEFAULT_CONF_DIRS="\$R/etc/xpra"
+export XPRA_COMMAND="$DEST/bin/xpra"
+export XPRA_PYTHON_COMMAND="$PYBIN"
+export PYTHONPATH="\$R/usr/lib64/python$PYTAG/site-packages:\$R/usr/lib/python$PYTAG/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
+export LD_LIBRARY_PATH="\$R/usr/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export PATH="\$R/usr/bin:\$PATH"
+exec "$PYBIN" "\$R/usr/bin/xpra" "\$@"
+WRAPPER
+    chmod +x "$DEST/bin/xpra"
+
+    # An extracted tree that cannot answer --version is worse than no tree at
+    # all: it satisfies find_prefix and every later command fails instead. Prove
+    # it runs, or leave nothing behind for the caller to fall back from.
+    if ! VERSION="$("$DEST/bin/xpra" --version 2>&1 | head -3)"; then
+        printf 'janela-server: the extracted packages do not run:\n%s\n' "$VERSION" >&2
+        rm -rf "${DEST:?}"
+        exit 1
+    fi
+    rm -rf "$STAGING"
+    printf 'prefix %s\n' "$DEST"
+    printf '%s\n' "$VERSION" | head -1
+    ;;
+
+ws)
+    # Where the HTML5 client connects. Read from the session rather than derived
+    # from the display: a session created before Janela bound a TCP socket has
+    # none, and saying so is more use than handing back a port nothing answers.
+    [ -n "${2:-}" ] || die "ws needs a display"
+    # xpra writes it as (('127.0.0.1', '14000'),); older builds use host:port.
+    # The address is one quoted string, so a quoted run of digits is the port
+    # and cannot be an octet of the address.
+    PORT="$(xpra info "$2" 2>/dev/null |
+            sed -n 's/^network\.sockets\.tcp\.listeners=//p' |
+            grep -oE "'[0-9]{2,5}'|127\.0\.0\.1:[0-9]{2,5}" |
+            grep -oE '[0-9]{2,5}' | head -1)"
+    [ -n "$PORT" ] || die \
+"session $2 has no websocket. It was created before Janela bound one; kill it
+ and create a new session, which will."
+    printf '%s\n' "$PORT"
+    ;;
+
+status)
+    # Everything the sidebar needs, in one round trip.
+    #
+    # Asking over ssh costs a whole connection - Windows OpenSSH has no
+    # ControlMaster, so there is no multiplexing to fall back on - and the old
+    # shape was one call for the list plus one per session, every ten seconds.
+    # The same `xpra info` calls happen here instead, where they are local.
+    LIST="$(xpra list 2>&1)"
+    printf '%s\n' "$LIST" | sed -n 's/.*\(LIVE\|DEAD\|UNKNOWN\) session at \(:[0-9]*\).*/\1 \2/p' |
+        sort -u -k2,2 | while read -r STATE DISP; do
+        printf -- '--- %s %s\n' "$DISP" "$STATE"
+        [ "$STATE" = LIVE ] || continue
+        # Only the keys anyone reads. `xpra info` is 600 lines a session and
+        # all of it would cross the network.
+        xpra info "$DISP" 2>/dev/null | grep -E \
+            '^(session\.name|state\.windows|clients|windows\.[0-9]+\.(title|geometry|size|override-redirect|window-type|pid|command|class-instance))='
+    done
+    printf -- '--- current %s\n' "$(cat "$CURRENT_FILE" 2>/dev/null || echo none)"
+    ;;
+
+shell-setup)
+    # Putting `janelas` on PATH, for whichever shell you actually use.
+    #
+    #   janela-server shell-setup           what would be added, and where
+    #   janela-server shell-setup --apply   add it, once
+    #
+    # An EDA server may default to bash, zsh or tcsh, and the line is different
+    # in each. Guessing wrong writes broken syntax into a startup file, which is
+    # a bad way to find out.
+    BIN="$JANELA_HOME/bin"
+    SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+    case "$SHELL_NAME" in
+    zsh)        RC="$HOME/.zshrc";        LINE="export PATH=\"$BIN:\$PATH\"" ;;
+    bash)       RC="$HOME/.bashrc";       LINE="export PATH=\"$BIN:\$PATH\"" ;;
+    tcsh)       RC="$HOME/.tcshrc"; [ -f "$RC" ] || RC="$HOME/.cshrc"
+                LINE="setenv PATH \"$BIN:\$PATH\"" ;;
+    csh)        RC="$HOME/.cshrc";        LINE="setenv PATH \"$BIN:\$PATH\"" ;;
+    fish)       RC="$HOME/.config/fish/config.fish"
+                LINE="set -gx PATH $BIN \$PATH" ;;
+    *)          RC="$HOME/.profile";      LINE="export PATH=\"$BIN:\$PATH\"" ;;
+    esac
+
+    printf 'shell %s\nfile  %s\nline  %s\n' "$SHELL_NAME" "$RC" "$LINE"
+    if grep -qs 'janela' "$RC" 2>/dev/null; then
+        printf 'state already set up\n'
+        exit 0
+    fi
+    if [ "${2:-}" != "--apply" ]; then
+        printf 'state not set up\n'
+        exit 0
+    fi
+    mkdir -p "$(dirname "$RC")" 2>/dev/null
+    # Marked, so this can tell its own line from the user's and never add a
+    # second one.
+    {
+        printf '\n# janela: run GUI tools on the session with `janelas <command>`\n'
+        printf '%s\n' "$LINE"
+    } >> "$RC" || die "could not write to $RC"
+    printf 'state added\n'
+    ;;
+
+survey)
+    printf 'host       %s\n' "$(hostname)"
+    printf 'user       %s\n' "$(id -un)"
+    printf 'prefix     %s\n' "${PREFIX:-none}"
+    printf 'xpra       %s\n' "$([ -n "$PREFIX" ] && PATH="$PREFIX/bin:$PATH" "$PREFIX/bin/xpra" --version 2>&1 | head -1 || echo none)"
+    printf 'glibc      %s\n' "$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')"
+    printf 'Xvfb       %s\n' "$(command -v Xvfb || echo none)"
+    printf 'xkbcomp    %s\n' "$(command -v xkbcomp || echo none)"
+    printf 'vncserver  %s\n' "$(command -v vncserver || echo none)"
+    printf 'conda      %s\n' "$(command -v conda || command -v micromamba || echo none)"
+    printf 'displays   %s\n' "$(displays_with_sockets | tr '\n' ' ')"
+    printf 'backend    %s\n' "$(pick_x_backend || echo none)"
+    printf 'terminal   %s\n' "$(for t in xterm xfce4-terminal konsole gnome-terminal x-terminal-emulator; do command -v $t && break; done || echo none)"
+    printf 'home free  %s\n' "$(df -h "$HOME" 2>/dev/null | awk 'NR==2{print $4}')"
+    ;;
+
+*)
+    die "usage: janela-server prefix|list|status|info <display>|new [name]|run <display> CMD|kill <display>|close <display> <wid>|kill-window <display> <wid>|current|set-current <display>|ws <display>|shell-setup [--apply]|env|install|bootstrap <tgz>|bootstrap-offline [staging]|rpm-check <py> [lib...]|bootstrap-rpm <dir> <py>|survey"
+    ;;
+esac

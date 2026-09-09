@@ -1,0 +1,277 @@
+{
+  "name": "janela",
+  "displayName": "Janela",
+  "description": "Manage persistent remote X11 sessions - tmux for GUI applications - and attach to them with xpra's native client.",
+  "version": "0.11.1",
+  "license": "GPL-3.0-or-later",
+  "publisher": "janela-local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "xpra",
+    "x11",
+    "remote",
+    "eda",
+    "waveform"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "janela.newSession",
+        "title": "Janela: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "janela.attach",
+        "title": "Janela: Open Session Windows",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "janela.launch",
+        "title": "Janela: Launch an Application",
+        "icon": "$(play)"
+      },
+      {
+        "command": "janela.kill",
+        "title": "Janela: Kill Session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "janela.refresh",
+        "title": "Janela: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "janela.survey",
+        "title": "Janela: Survey the Server"
+      },
+      {
+        "command": "janela.installServer",
+        "title": "Janela: Set Up xpra on the Server"
+      },
+      {
+        "command": "janela.openSession",
+        "title": "Janela: Open Whole Session in One Window"
+      },
+      {
+        "command": "janela.closeWindow",
+        "title": "Janela: Close This Application",
+        "icon": "$(close)"
+      },
+      {
+        "command": "janela.killWindow",
+        "title": "Janela: Kill This Application",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "janela.revealWindow",
+        "title": "Janela: Show This Window"
+      },
+      {
+        "command": "janela.setUpWrapper",
+        "title": "Janela: Set Up the Shell Wrapper"
+      }
+    ],
+    "configuration": {
+      "title": "Janela",
+      "properties": {
+        "janela.host": {
+          "type": "string",
+          "default": "",
+          "description": "Server to manage sessions on. Empty means: use the host this window is already connected to over Remote-SSH."
+        },
+        "janela.user": {
+          "type": "string",
+          "default": "",
+          "description": "SSH user. Empty means: let your ssh config decide, which is usually right."
+        },
+        "janela.serverPrefix": {
+          "type": "string",
+          "default": "",
+          "description": "Directory on the server containing bin/xpra. Empty means the server script finds one itself."
+        },
+        "janela.startCommand": {
+          "type": "string",
+          "default": "",
+          "description": "What to start in a new session so it is not empty. Empty means the server picks the first terminal it finds; 'none' starts nothing, which leaves the session invisible until you run something in it yourself."
+        },
+        "janela.applications": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "What to call it in the list."
+              },
+              "command": {
+                "type": "string",
+                "description": "Exactly what you would type in a terminal on the server."
+              }
+            }
+          },
+          "description": "Applications offered when launching into a session. The command runs through a login shell on the server, so module load and conda work. Leave empty to type a command each time."
+        },
+        "janela.serverDir": {
+          "type": "string",
+          "default": "~/.vscode-server/janela",
+          "description": "Where Janela keeps its scripts, the janelas wrapper and xpra on the server. Inside VS Code's folders, but not under extension storage - that gets deleted with the extension. A full 'Uninstall VS Code Server from Host' still removes it, and Janela puts it back."
+        },
+        "janela.payloadMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "lite",
+            "bundled",
+            "conda"
+          ],
+          "enumDescriptions": [
+            "Use the payload this build carries, and download one if it carries none.",
+            "Always download the packages here and copy them across, even if this build carries a bundle.",
+            "Only use a bundle carried by this build; do not download.",
+            "Ask the server to install xpra from conda-forge itself. Needs internet on that machine."
+          ],
+          "default": "auto",
+          "description": "How xpra gets onto the server when it is missing."
+        },
+        "janela.windowMode": {
+          "type": "string",
+          "enum": [
+            "per-window",
+            "session"
+          ],
+          "enumDescriptions": [
+            "Every application window gets its own operating-system window.",
+            "The whole session in one window, with its windows drawn inside it. Use this when a tool's menus are clipped."
+          ],
+          "default": "per-window",
+          "description": "How a session is put on screen when you open it."
+        },
+        "janela.grabMode": {
+          "type": "string",
+          "enum": [
+            "pointer",
+            "always",
+            "manual"
+          ],
+          "enumDescriptions": [
+            "Take the keyboard while the pointer is over the window. Leaving it gives VS Code its shortcuts back.",
+            "Take the keyboard whenever the window has focus.",
+            "Never take it automatically; toggle it yourself."
+          ],
+          "default": "pointer",
+          "description": "When a window takes the keyboard. Ctrl+Alt+G always toggles it, and Alt+Tab and Ctrl+Alt+Del are never taken - the OS claims those first."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "janela",
+          "title": "Janela",
+          "icon": "media/janela.svg"
+        }
+      ]
+    },
+    "views": {
+      "janela": [
+        {
+          "id": "janela.sessions",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "janela.newSession",
+          "when": "view == janela.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "janela.refresh",
+          "when": "view == janela.sessions",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "janela.attach",
+          "when": "view == janela.sessions && viewItem == janela.session.live",
+          "group": "inline@1"
+        },
+        {
+          "command": "janela.launch",
+          "when": "view == janela.sessions && viewItem == janela.session.live",
+          "group": "inline@2"
+        },
+        {
+          "command": "janela.kill",
+          "when": "view == janela.sessions && viewItem =~ /^janela.session/",
+          "group": "inline@2"
+        },
+        {
+          "command": "janela.openSession",
+          "when": "view == janela.sessions && viewItem == janela.session.live",
+          "group": "janela@1"
+        },
+        {
+          "command": "janela.closeWindow",
+          "when": "view == janela.sessions && viewItem =~ /^janela\\.window/",
+          "group": "inline@1"
+        },
+        {
+          "command": "janela.killWindow",
+          "when": "view == janela.sessions && viewItem == janela.window.killable",
+          "group": "inline@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "janela.revealWindow",
+          "when": "false"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "janela.sessions",
+        "contents": "No sessions are running on this server.\n\nA session is a desktop that outlives this window: applications you start in it keep running when you close your laptop, and are still there when you come back.\n\n[New Session](command:janela.newSession)\n\nAlready have one running from a shell? [Refresh](command:janela.refresh).\n\nTo start tools from your own terminal, [set up the janelas wrapper](command:janela.setUpWrapper)."
+      }
+    ]
+  },
+  "scripts": {
+    "esbuild:extension": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=dist/extension.js",
+    "build": "npm run esbuild:extension -- --minify",
+    "dev": "npm run esbuild:extension -- --sourcemap",
+    "typecheck": "tsc -p ./ --noEmit",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "vscode:prepublish": "npm run build",
+    "package": "test ! -d bundle || (echo \"bundle/ exists - a bundled build is in flight or left one behind\" && false) && npx --yes @vscode/vsce package --no-dependencies -o janela.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CaioPlazas/janela.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CaioPlazas/janela/issues"
+  },
+  "homepage": "https://github.com/CaioPlazas/janela#readme"
+}
