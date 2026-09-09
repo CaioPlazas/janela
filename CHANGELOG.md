@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.11.2 - 2026-09-09
+
+The first public release, and four faults found while preparing it.
+
+- **A missing `ssh` crashed the extension host.** `spawn` does not throw when the binary is not
+  there; it emits an `error` event, and an `error` event with no listener is an uncaught exception.
+  A machine without OpenSSH on `PATH` took Janela down instead of being told what was missing.
+- **Provisioning could not work without ssh at all.** Only the script push checked for local mode;
+  the bundled, lite and distribution-package routes each built `scp -r <dir> :~/...` with no host.
+  All copying now goes through one place that knows where the server is.
+- **A failed record of the current session was silent.** The session would run and `janelas` would
+  never find it — the same "the tool went somewhere invisible" fault the wrapper was changed to
+  stop causing.
+- **A window that could not be opened said nothing**, becoming an unhandled rejection.
+
+Also: `scripts/README.md` documented four scripts that no longer exist and omitted four that do.
+It is folded into the README, because a second index of the same directory is a second thing to
+keep true, and this one had not been true for weeks.
+
+The source now lives at **https://github.com/CaioPlazas/janela**, with the VSIX attached to each
+release. `media/www` is xpra-html5 v20, unmodified, under the MPL-2.0.
+
 ## 0.11.1 - 2026-09-08
 
 Housekeeping. No behaviour changes.
